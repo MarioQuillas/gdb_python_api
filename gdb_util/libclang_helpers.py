@@ -22,6 +22,19 @@
 from clang import cindex
 from os import path
 
+# CompilationDatabase.getCompileCommands() will try to "infer" build commands
+# for files that are not present in the compilation database - including headers,
+# surprisingly. See https://bugs.llvm.org/show_bug.cgi?id=50249
+# We don't want this, so here's our alternative implementation:
+
+def _getCompileCommands(compdb, fname):
+    """Return a list of commands to build fname. If fname is not found in compdb, return None"""
+
+    all_cmds = compdb.getAllCompileCommands()
+    cmds = [cmd for cmd in all_cmds if cmd.filename == path.abspath(fname)]
+    return cmds if len(cmds) > 0 else None
+
+
 def getASTNode(fname, line, column, tu_fname = None, compdb_fname = './compile_commands.json'):
     """Find the enclosing AST node of a given location
 
@@ -45,7 +58,7 @@ def getASTNode(fname, line, column, tu_fname = None, compdb_fname = './compile_c
     # Step 2: query compilation flags
     if tu_fname is None:        # indicates file is the translation unit
         tu_fname = fname
-    cmds = compdb.getCompileCommands(tu_fname)
+    cmds = _getCompileCommands(compdb, tu_fname)
 
     # getCompileCommands signals "not found" with None result
     if cmds is None:
@@ -67,27 +80,36 @@ def getASTNode(fname, line, column, tu_fname = None, compdb_fname = './compile_c
         else:
             args.append(arg)
 
-    translation_unit = index.parse(tu_fname, args)
-    # TODO: this would be an excellent place to cache the parse results
-    # compilation could take a noticeable amount of time
 
-    if (len(translation_unit.diagnostics) > 0):
-        print(['%s:%s'%(x.category_name, x.spelling) for x in translation_unit.diagnostics])
-        raise RuntimeError('Failure during libclang parsing')
+    try:
+        translation_unit = index.parse(tu_fname, args)
 
-    # we can go from TU's primary cursor to a specific file location with:
-    loc = cindex.SourceLocation.from_position(translation_unit,
-                                              translation_unit.get_file(fname),
-                                              line, column)
-    cur = cindex.Cursor.from_location(translation_unit, loc)
+        # TODO: this would be an excellent place to cache the parse results
+        # compilation could take a noticeable amount of time
 
-    return cur
+        if (len(translation_unit.diagnostics) > 0):
+            print(['%s:%s'%(x.category_name, x.spelling) for x in translation_unit.diagnostics])
+            raise RuntimeError('Failure during libclang parsing')
+
+        # we can go from TU's primary cursor to a specific file location with:
+        loc = cindex.SourceLocation.from_position(translation_unit,
+                                                  translation_unit.get_file(fname),
+                                                  line, column)
+        cur = cindex.Cursor.from_location(translation_unit, loc)
+
+        return cur
+
+    except cindex.TranslationUnitLoadError as e:
+        print('TranslationUnitLoadError while parsing %s with args:' % tu_fname)
+        print(args)
+        raise
+
 
 # supply the next sibling of a statement (for e.g. implementing "next")
 def getASTSibling(parent, node):
     """Return the next sibling of a node in the AST, if present"""
 
-    if parent.kind is not cindex.CursorKind.COMPOUND_STMT:
+    if not parent or parent.kind is not cindex.CursorKind.COMPOUND_STMT:
         # don't know what to do here
         raise RuntimeError('AST node on line %d is not a child of a compound statement - cannot determine next statement'%node.location.line)
     sibling = None
@@ -123,7 +145,7 @@ def findFirstTU(files, compdb_fname='./compile_commands.json'):
         raise RuntimeError('Could not load compilation database for %s'%compilation_database_path)
 
     for fn in files:
-        cmds = compdb.getCompileCommands(fn)
+        cmds = _getCompileCommands(compdb, fn)
         if cmds is not None:
             return fn
     return None
